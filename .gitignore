@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+
+# 运行产物（密钥与备份，不入库）
+key.pem
+new_public_key.pem
+app.asar.bak
+
+# macOS
+.DS_Store
+
+# 临时
+ext/
