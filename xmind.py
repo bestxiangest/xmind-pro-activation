@@ -37,22 +37,17 @@ class KeyGen(metaclass=ABCMeta):
         print(f'plaintext_licenses: \n{plaintext_licenses}')
 
 
-def _find_resources_dir():
-    """Locate the Xmind resources dir of the current platform.
+def _find_macos_resources_dir():
+    """Locate the Xmind resources dir on macOS.
 
-    Windows: %LOCALAPPDATA%\\Programs\\Xmind\\resources (via TMP parent)
     macOS:   /Applications/Xmind.app/Contents/Resources
+             or ~/Applications/Xmind.app/Contents/Resources
     Override with env XMIND_RESOURCES_DIR when Xmind lives elsewhere.
     """
     override = os.environ.get("XMIND_RESOURCES_DIR")
     if override:
         return pathlib.Path(override)
 
-    if sys.platform == "win32":
-        tmp = os.environ.get("TMP") or os.environ.get("TEMP") or ""
-        return pathlib.Path(tmp).parent.joinpath("Programs", "Xmind", "resources")
-
-    # macOS / other unix: look for the app bundle
     candidates = [
         pathlib.Path("/Applications/Xmind.app/Contents/Resources"),
         pathlib.Path.home() / "Applications/Xmind.app/Contents/Resources",
@@ -66,20 +61,28 @@ def _find_resources_dir():
 class XmindKeyGen(KeyGen):
 
     def __init__(self):
-        self.is_macos = sys.platform == "darwin"
-        self.resources_dir = _find_resources_dir()
-        self.asar_file = self.resources_dir.joinpath("app.asar")
-        self.asar_file_bak = self.resources_dir.joinpath("app.asar.bak")
-        self.crack_asar_dir = self.resources_dir.joinpath("ext")
+        if sys.platform == "win32":
+            # ---------------- Windows: 原始实现，与最初版本一致 ----------------
+            tmp_path = os.environ['TMP']
+            asar_path = pathlib.Path(tmp_path).parent.joinpath(r'Programs\Xmind\resources')
+            self.is_macos = False
+        else:
+            # ---------------- macOS: 现有实现 ----------------
+            self.is_macos = sys.platform == "darwin"
+            asar_path = _find_macos_resources_dir()
+        self.resources_dir = asar_path
+        self.asar_file = asar_path.joinpath('app.asar')
+        self.asar_file_bak = asar_path.joinpath('app.asar.bak')
+        self.crack_asar_dir = asar_path.joinpath('ext')
         self.main_dir = self.crack_asar_dir.joinpath("main")
         self.renderer_dir = self.crack_asar_dir.joinpath("renderer")
         self.private_key = None
         self.public_key = None
-        self.old_public_key = open("old.pem").read()
+        self.old_public_key = open('old.pem').read()
 
     def generate(self):
-        if os.path.isfile("key.pem"):
-            rsa = CryptoPlus.load("key.pem")
+        if os.path.isfile('key.pem'):
+            rsa = CryptoPlus.load('key.pem')
         else:
             rsa = CryptoPlus.generate_rsa(1024)
             rsa.dump("key.pem", "new_public_key.pem")
@@ -92,32 +95,66 @@ class XmindKeyGen(KeyGen):
     def parse(self, licenses):
         return decrypt_by_key(self.public_key, b64decode(licenses))
 
+    # ==================== Windows 分支（原始行为，勿改动） ====================
+
+    def _patch_windows(self):
+        # 解包
+        extract_asar(str(self.asar_file), str(self.crack_asar_dir))
+        shutil.copytree('crack', self.main_dir, dirs_exist_ok=True)
+        # 注入
+        with open(self.main_dir.joinpath('main.js'), 'rb') as f:
+            lines = f.readlines()
+            lines[5] = b'require("./hook")\n'
+        with open(self.main_dir.joinpath('main.js'), 'wb') as f:
+            f.writelines(lines)
+        # 替换密钥
+        old_key = f"String.fromCharCode({','.join([str(i) for i in self.old_public_key.encode()])})".encode()
+        new_key = f"String.fromCharCode({','.join([str(i) for i in self.public_key.export_key()])})".encode()
+        for js_file in self.renderer_dir.rglob("*.js"):
+            with open(js_file, 'rb') as f:
+                byte_str = f.read()
+                index = byte_str.find(old_key)
+                if index != -1:
+                    byte_str.replace(old_key, new_key)
+                    with open(js_file, 'wb') as _f:
+                        _f.write(byte_str.replace(old_key, new_key))
+                    print(js_file)
+                    break
+        # 占位符填充
+        with open(self.main_dir.joinpath('hook.js'), 'r', encoding='u8') as f:
+            content = f.read()
+            content = content.replace("{{license_data}}", self.license_data.decode())
+        with open(self.main_dir.joinpath('hook.js'), 'w', encoding='u8') as f:
+            f.write(content)
+        with open(self.main_dir.joinpath('hook').joinpath('crypto.js'), 'r', encoding='u8') as f:
+            content = f.read()
+            content = content.replace("{{old_public_key}}", self.old_public_key.replace("\n", "\\n"))
+            content = content.replace("{{new_public_key}}", self.public_key.export_key().decode().replace("\n", "\\n"))
+        with open(self.main_dir.joinpath('hook').joinpath('crypto.js'), 'w', encoding='u8') as f:
+            f.write(content)
+        # 封包
+        os.remove(self.asar_file)
+        pack_asar(self.crack_asar_dir, self.asar_file)
+        shutil.rmtree(self.crack_asar_dir)
+
+    # ==================== macOS 分支（现有实现，勿改动） ====================
+
     def _inject_hook(self):
         """Inject require('./hook') into main/main.js.
 
-        Windows builds ship a multi-line main.js (replace line 6, like the
-        original script). macOS builds ship a single-line webpack bundle:
-        replacing `lines[5]` would raise IndexError, so we append the
-        require at the end of the file instead (webpack's IIFE already ran,
-        `require` here is Node's CommonJS require and resolves ./hook.js).
+        macOS builds ship a single-line webpack bundle: replacing `lines[5]`
+        would raise IndexError, so we append the require at the end of the
+        file instead (webpack's IIFE already ran, `require` here is Node's
+        CommonJS require and resolves ./hook.js).
         """
         main_js = self.main_dir.joinpath("main.js")
         with open(main_js, "rb") as f:
             content = f.read()
         if b'require("./hook")' in content:
             return
-        lines = content.splitlines()
-        if len(lines) > 5:
-            # legacy multi-line layout: rewrite line 6 (index 5)
-            lines[5] = b'require("./hook")'
-            content = b"\n".join(lines)
-            if not content.endswith(b"\n"):
-                content += b"\n"
-        else:
-            # compact single-line bundle (macOS): append at the end
-            if not content.endswith(b"\n"):
-                content += b"\n"
-            content += b'require("./hook");\n'
+        if not content.endswith(b"\n"):
+            content += b"\n"
+        content += b'require("./hook");\n'
         with open(main_js, "wb") as f:
             f.write(content)
 
@@ -148,7 +185,7 @@ class XmindKeyGen(KeyGen):
             else:
                 print("[!] 签名校验未通过:", verify.stderr)
 
-    def patch(self):
+    def _patch_macos(self):
         # 解包
         extract_asar(str(self.asar_file), str(self.crack_asar_dir))
         shutil.copytree("crack", self.main_dir, dirs_exist_ok=True)
@@ -188,6 +225,12 @@ class XmindKeyGen(KeyGen):
         # macOS 下重签，否则应用无法启动
         self._sign_app()
 
+    def patch(self):
+        if sys.platform == "win32":
+            self._patch_windows()
+        else:
+            self._patch_macos()
 
-if __name__ == "__main__":
+
+if __name__ == '__main__':
     XmindKeyGen().run()
